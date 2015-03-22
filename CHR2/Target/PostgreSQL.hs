@@ -4,6 +4,7 @@ module CHR2.Target.PostgreSQL where
 
 import CHR2.AST.Untyped
 import Data.String.Interpolate
+import Data.Function
 import Control.Monad
 import Control.Monad.Error
 import Control.Monad.RWS.Strict
@@ -43,6 +44,7 @@ makeColNames = flip evalState 0 . mapM hlp
 constrSchema :: String -> TableInfo -> String
 constrSchema n TableInfo{..} = 
     [i|
+DROP TABLE IF EXISTS c$#{n} CASCADE;
 CREATE TABLE c$#{n} (
    id SERIAL PRIMARY KEY,
    #{sep ",\n   " $ map hlp $ zip tiTypes tiCols}
@@ -60,7 +62,7 @@ data BuiltinDef = Infix String
 builtinDefs = M.fromList [
                ("==", Infix "="),
                ("<", Infix "<"),
-               ("<=", Infix "=<"),
+               ("<=", Infix "<="),
                (">", Infix ">"),
                (">=", Infix ">="),
                ("!=", Infix "<>"),
@@ -75,7 +77,8 @@ data Env = Env {
       builtins :: M.Map String BuiltinDef,
       aggregates :: M.Map String AggregateDef,
       rules :: [Rule],
-      tables :: M.Map TableName TableInfo
+      tables :: M.Map TableName TableInfo,
+      priority :: [((C,C),[Term])] 
     }
 
 tySomeStr :: Ty -> String
@@ -95,8 +98,9 @@ makeNames v = evalState (mapM hlp v) M.empty
 mkEnv :: M.Map String [(Maybe String, Ty)] -> 
          M.Map String BuiltinDef -> 
          M.Map String AggregateDef ->
-         [Rule] -> Env
-mkEnv c builtins aggregates rules = Env{..}
+         [Rule] ->
+         [((C,C),[Term])] -> Env
+mkEnv c builtins aggregates rules priority = Env{..}
     where
       constrs = M.map (map snd) c
       tables = M.map (\n -> TableInfo (makeNames n) (map snd n) ) c
@@ -293,7 +297,8 @@ analyzeHeadItem x (n, a) = do
           `opt` (analyzeChrConstr False x, constrs)
           `opt` (preAnalyzeBuiltin, builtins)
           `opt` (preAnalyzeAggregate, aggregates)
-  
+          `opt` (analyzeBuiltin, builtins)
+          `opt` (analyzeAggregate, aggregates)  
   where opt nxt (h,b) = maybe nxt (h n a) =<< asks (M.lookup n . b)
 
 analyzeBodyBatch :: [C] -> RAM ()
@@ -308,6 +313,21 @@ analyzeBodyBatch c = do
          unless b $ err $ "unknown constraint in rule's body: " ++ show n
       return r
 
+-- adds condition for avoiding same constraint in single rule
+--       riHConstrTables :: M.Map Int (TableInfo,C),
+
+distinctConstr :: RAM ()
+distinctConstr =
+  mapM_ (\a -> 
+         mapM_ (\(l,r) -> addSqlCond [i|t$#{l}.id <> t$#{r}.id|]) 
+            [(i,j) | i <- a, j <- a, i /= j]
+            ) =<< gets (map (map snd)
+                    . filter((> 1) . length)
+                    . groupBy ((==) `on` fst)
+                    . sortBy (compare `on` fst)
+                    . map (\(k,(_,(n,_))) -> (n,k)) 
+                    . M.toList . riHConstrTables)
+
 -- TODO:
 isOper :: String -> Bool
 isOper n = 
@@ -317,6 +337,7 @@ isOper n =
 analyzeRule :: Rule -> RAM ()
 analyzeRule r@Rule{..} = do
   mapM_ (uncurry analyzeHeadItem) $ zip [0..] ruleHead
+  distinctConstr
   mapM_ analyzeBodyBatch ruleBody
 
 termToSql :: Term -> String
@@ -343,6 +364,7 @@ writeRulePreView = do
   let tables = M.toList riHConstrTables
   let flds = map (\ (x,_) -> [i|t$#{x}.id AS t$#{x}$id|]) tables
           ++ map (\(n,(v:_)) -> [i|#{sqlValStr v} AS #{n}|]) vars
+  
   let ph = null riNegative
       phc = 
           [i|chr$ph.ruleId = #{riId}|] :
@@ -350,7 +372,7 @@ writeRulePreView = do
                 (zip [0..] $ M.elems riHConstrTables)
       phcond = emptyUnless ph 
              [[i|
-    EXISTS (SELECT 1 FROM chr$ph WHERE #{sep " AND " $ phc})|]] 
+    NOT EXISTS (SELECT 1 FROM chr$ph WHERE #{sep " AND " $ phc})|]] 
   tell [i|
 CREATE VIEW pr$#{riName} AS SELECT\n|]
   tell $ ind 1 $ sep ", " flds
@@ -378,9 +400,7 @@ condStr n = [i|WHERE #{sep " AND " n}|]
 writeRuleView :: RWM () 
 writeRuleView = do
   RuleInfo{..} <- ask
-  -- TODO: use compiled before priorities
-  tell [i|
-|]
+
   tell [i|
 CREATE VIEW r$#{riName} AS SELECT * FROM pr$#{riName};|]
 
@@ -389,10 +409,14 @@ tellLine n = tell "\n" >> tell n
 writeSolveScript :: RWM ()
 writeSolveScript = do
   RuleInfo{..} <- ask
-  tellLine "BEGIN;"
   tellLine [i|
+CREATE OR REPLACE FUNCTION step$#{riName}() RETURNS INTEGER AS $$|] 
+  tellLine [i|
+DECLARE
+  result INTEGER;
+BEGIN
 CREATE TEMP TABLE t$#{riName}
-       ON COMMIT PRESERVE ROWS
+       -- ON COMMIT PRESERVE ROWS
        AS SELECT * FROM r$#{riName};|]
   -- DELETES
   mapM_ (\c@(x,(n,_)) -> do 
@@ -402,15 +426,17 @@ DELETE FROM c$#{n}
     WHERE id = tmp.t$#{x}$id;|]
                ) riNegative
   when (null riNegative) $ do
-    let pcond = concat $ map (\(x,_) -> [i| AND c#{x} = t$#{x}$id|]) riPositive
+    let (col,val) = unzip
+                    $ map (\(x,_) -> ([i|,c#{x}|], [i|,t$#{x}$id|])) riPositive
     tell [i|
-DELETE FROM chr$ph 
-    USING t$#{riName} c
-    WHERE ruleId = #{riId}#{pcond};|]
-  tellLine "COMMIT;"
+INSERT INTO chr$ph(ruleId#{concat col}) 
+       SELECT '#{riId}'#{concat val}
+       FROM t$#{riName};
+|]
+  tellLine "-- COMMIT;"
   -- BATCHES: TODO
   mapM_ (\ BatchInfo{..} -> do
-         tellLine "BEGIN;"
+         tellLine "-- BEGIN;"
          -- TODO: this probably should be interleaved in order they appear
          mapM_ (\(isChr,(n,args)) -> 
                     if isChr then do
@@ -421,8 +447,14 @@ INSERT INTO c$#{n}(#{sep ", " tiCols})
                     else do
                       return ()
                ) biConstrs
-         tellLine "COMMIT;"
+         tellLine "-- COMMIT;"
        ) riBatches
+  tellLine [i|
+result := (SELECT count(*) FROM t$#{riName});
+DROP TABLE t$#{riName};
+RETURN result;
+END;
+$$  LANGUAGE plpgsql;|]
   return ()
 
 translateEnv :: M ()
@@ -447,6 +479,7 @@ translateRules = do
     let mxp = maximum $ map (length . riPositive) 
               $ filter (null . riNegative) ri
     tell [i|
+DROP TABLE IF EXISTS chr$ph;
 CREATE TABLE chr$ph (
     ruleId INTEGER,
     #{sep ",\n    " $ 
@@ -457,7 +490,7 @@ CREATE TABLE chr$ph (
     tellLine "---------------- SOLVE STEPS -------------------"
     step writeSolveScript
 
-test1Env = mkEnv constrs builtinDefs M.empty rules
+test1Env = mkEnv constrs builtinDefs M.empty rules pri
       where
         constrs = M.fromList 
                   [("source",[(Nothing,IntTy)]),
@@ -476,11 +509,16 @@ test1Env = mkEnv constrs builtinDefs M.empty rules
                [("dist",[Var "V", Var "D"]),
                 ("edge",[Var "V", Var "C", Var "U"])]
                [[("dist", [Var "U", Ftr "+" [Var "D", Var "C"]])]]
+        pri = [
+            ((("keep_shortest",[]), ("label",[Var "X"])),[]),
+            ((("label",[Var "X"]),("label",[Var "Y"])),
+             [Ftr "<" [Var "X", Var "Y"]])
+         ]
 
 runTest1 :: IO ()
 runTest1 = 
     case runM test1Env translateEnv of
-      Right (v,w) -> putStrLn w
+      Right (v,w) -> writeFile "dijkstra_migrate.sql" w
       Left e -> fail e
 
 
