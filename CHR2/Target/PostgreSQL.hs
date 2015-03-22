@@ -478,6 +478,7 @@ translateRules = do
         =<< analyzeRules
     let mxp = maximum $ map (length . riPositive) 
               $ filter (null . riNegative) ri
+    let names = map riName ri
     tell [i|
 DROP TABLE IF EXISTS chr$ph;
 CREATE TABLE chr$ph (
@@ -489,6 +490,25 @@ CREATE TABLE chr$ph (
     step writeRuleView
     tellLine "---------------- SOLVE STEPS -------------------"
     step writeSolveScript
+
+    let decls = concat $ map (\x -> [i|
+  #{x}$exit BOOLEAN;|]) names
+    let calls = concat $ map (\x -> [i|
+    #{x}$exit := step$#{x}() = 0;|]) names
+    let exitCond = sep " AND " $ map (\x -> [i|#{x}$exit|]) names
+    tell [i|
+CREATE OR REPLACE FUNCTION simple$solver() RETURNS BOOLEAN AS $$
+DECLARE#{decls}
+BEGIN
+  LOOP#{calls}
+    IF #{exitCond} THEN
+       EXIT;
+    END IF;
+  END LOOP;
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+|]
 
 test1Env = mkEnv constrs builtinDefs M.empty rules pri
       where

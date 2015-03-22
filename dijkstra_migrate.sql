@@ -111,3 +111,20 @@ DROP TABLE t$label;
 RETURN result;
 END;
 $$  LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION simple$solver() RETURNS BOOLEAN AS $$
+DECLARE
+  init$exit BOOLEAN;
+  keep_shortest$exit BOOLEAN;
+  label$exit BOOLEAN;
+BEGIN
+  LOOP
+    init$exit := step$init() = 0;
+    keep_shortest$exit := step$keep_shortest() = 0;
+    label$exit := step$label() = 0;
+    IF init$exit AND keep_shortest$exit AND label$exit THEN
+       EXIT;
+    END IF;
+  END LOOP;
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
