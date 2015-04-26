@@ -1,0 +1,9 @@
+:- name(dijkstra) .
+:- constraints(source-[node-int],
+               dist-[to-int,weight-double],
+               edge-[from-int,weight-double,to-int]) .
+
+init @ +source(C) => dist(C,0) .
+keep_shortest @ +dist(V,D1), -dist(V,D2), D1 =< D2 .
+label @ +dist(V,D), +edge(V,C,U) => dist(U,D+C) .
+
