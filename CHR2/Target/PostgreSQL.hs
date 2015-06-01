@@ -1,4 +1,4 @@
-{-# LANGUAGE QuasiQuotes, RecordWildCards #-}
+{-# LANGUAGE QuasiQuotes, RecordWildCards, NamedFieldPuns #-}
 {-# LANGUAGE FlexibleContexts #-}
 module CHR2.Target.PostgreSQL where
 
@@ -19,7 +19,6 @@ import Data.List
 import Data.List.Split 
 import Database.Persist
 
-
 import CHR2.AST.Untyped
 import CHR2.Compile
 
@@ -33,8 +32,8 @@ import CHR2.Compile
 constrSchema :: String -> TableInfo -> String
 constrSchema n TableInfo{..} = 
     [i|
-DROP TABLE IF EXISTS "c$#{n}" CASCADE;
-CREATE TABLE "c$#{n}" (
+DROP TABLE IF EXISTS "#{n}" CASCADE;
+CREATE TABLE "#{n}" (
    id SERIAL PRIMARY KEY,
    #{sep ",\n   " $ map hlp $ zip _tiTypes _tiCols}
 );
@@ -45,28 +44,44 @@ CREATE TABLE "c$#{n}" (
 -- adds condition for avoiding same constraint in single rule
 --       riHConstrTables :: M.Map Int (TableInfo,C),
 
+needsPH :: RuleInfo -> Bool
+needsPH _ = False -- TODO: aggregations may need it
+
+isPRule :: RuleInfo -> Bool
+isPRule RuleInfo{_riNegative} = null _riNegative 
+
 -- TODO: needs vars' resolution, since some may be bound to another vars
 writeRulePreView :: RWM ()
 writeRulePreView = do
-  RuleInfo{..} <- ask
+  ri@RuleInfo{..} <- ask
   let vars = M.toList _riVarDef
   let tables = M.toList _riHConstrTables
   let flds = map (\ (x,_) -> [i|t$#{x}.id AS t$#{x}$id|]) tables
           ++ map (\(n,(v:_)) -> [i|#{sqlValStr v} AS #{n}|]) vars
-  
-  let ph = null _riNegative
-      phc = 
+  let 
+      -- propagation history in separate table
+      phc =
           [i|chr$ph.ruleId = #{_riId}|] :
-          map (\(x,(_,_)) -> [i|t$#{x}.id = chr$ph.c#{x}|]) 
-                (zip [0..] $ M.elems _riHConstrTables)
-      phcond = emptyUnless ph 
-             [[i|
-    NOT EXISTS (SELECT 1 FROM chr$ph WHERE #{sep " AND " $ phc})|]] 
+          map (\(x,_) -> [i|t$#{x}.id = chr$ph$c#{x}|]) tables
+      phcond = if isPRule ri then
+                   if needsPH ri then [[i| 
+         NOT EXISTS (SELECT 1 FROM chr$ph WHERE #{sep " AND " $ phc})|]]
+                   else let phc = concat
+                             $ intersperse " OR " 
+                             $ map (\(x,_) -> [i|t$#{x}.chr$ph$c#{x} <> 't'|]) 
+                              tables
+                       in [[i|(#{phc})|]]
+               else []
+  when (isPRule ri && not (needsPH ri)) $ 
+       mapM_ (\(x,(_,C _ a _)) -> 
+          tellLine 
+             [i|ALTER TABLE #{a} ADD COLUMN chr$ph$c#{x} BOOLEAN DEFAULT 'f';|]
+             ) tables
   tell [i|
 CREATE VIEW pr$#{_riName} AS SELECT\n|]
   tell $ ind 1 $ sep ", " flds
   tell "\n\tFROM "
-  tell $ sep ", " $ map (\ (x,(_,(C _ a _))) -> [i|c$#{a} t$#{x}|]) tables
+  tell $ sep ", " $ map (\ (x,(_,(C _ a _))) -> [i|#{a} t$#{x}|]) tables
   let cond = (concat 
               $ map (\(n, e) -> 
                  map (\ (l,r) -> [i|#{l} = #{r}|]) $ pairs $ map sqlValStr e
@@ -97,7 +112,7 @@ tellLine n = tell "\n" >> tell n
 
 writeSolveScript :: RWM ()
 writeSolveScript = do
-  RuleInfo{..} <- ask
+  ri@RuleInfo{..} <- ask
   tellLine [i|
 CREATE OR REPLACE FUNCTION step$#{_riName}() RETURNS INTEGER AS $$|] 
   tellLine [i|
@@ -110,18 +125,23 @@ CREATE TEMP TABLE t$#{_riName}
   -- DELETES
   mapM_ (\c@(x,(C _ n _)) -> do 
         tell [i|
-DELETE FROM c$#{n}
+DELETE FROM #{n}
     USING t$#{_riName} tmp
     WHERE id = tmp.t$#{x}$id;|]
                ) _riNegative
-  when (null _riNegative) $ do
+  when (isPRule ri) $ do
     let (col,val) = unzip
                     $ map (\(x,_) -> ([i|,c#{x}|], [i|,t$#{x}$id|])) _riPositive
-    tell [i|
+    if needsPH ri then
+        tell [i|
 INSERT INTO chr$ph(ruleId#{concat col}) 
        SELECT '#{_riId}'#{concat val}
-       FROM t$#{_riName};
-|]
+       FROM t$#{_riName};|]
+     else
+         mapM_ (\(x,C _ tn _) -> tell [i|
+UPDATE #{tn} SET chr$ph$c#{x} = 'y' 
+    FROM t$#{_riName}
+    WHERE #{tn}.id = t$#{_riName}.t$#{x}$id;|]) _riPositive 
   tellLine "-- COMMIT;"
   -- BATCHES: TODO
   mapM_ (\ BatchInfo{..} -> do
@@ -131,7 +151,7 @@ INSERT INTO chr$ph(ruleId#{concat col})
                     if isChr then do
                       TableInfo{..} <- getTableInfo n
                       tell [i|
-INSERT INTO c$#{n}(#{sep ", " $ map show _tiCols}) 
+INSERT INTO #{n}(#{sep ", " $ map show _tiCols}) 
        SELECT #{sep ", " $ map termToSql args} FROM t$#{_riName};|]
                     else do
                       return ()
